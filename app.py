@@ -14,6 +14,8 @@ import plotly.express as px
 import yfinance as yf
 from datetime import datetime, timedelta
 
+st.write("Secrets:", list(st.secrets.keys()))
+
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Nifty 50 Screener | Paterson Securities",
@@ -203,17 +205,13 @@ def flag_badge(val):
 # ── AUTH & DATA ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gc():
-    creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not creds_json:
-        try: creds_json = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
-        except: pass
-    if creds_json:
-        info = json.loads(creds_json) if isinstance(creds_json, str) else dict(creds_json)
-    else:
-        with open("service_account.json") as f:
-            info = json.load(f)
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    # gspread >= 6 — use Client directly instead of deprecated gspread.authorize()
+    info = dict(st.secrets["gcp_service_account"])
+
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=SCOPES,
+    )
+
     return gspread.Client(auth=creds)
 
 @st.cache_data(ttl=300)
