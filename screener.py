@@ -65,14 +65,15 @@ OUTPUT_COLS = [
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
 def get_gspread_client():
-    creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if creds_json:
-        info = json.loads(creds_json) if isinstance(creds_json, str) else dict(creds_json)
-    else:
-        with open("service_account.json") as f:
-            info = json.load(f)
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    # gspread >= 5: gspread.authorize() removed — use Client directly
+    import streamlit as st
+
+    info = dict(st.secrets["gcp_service_account"])
+
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=SCOPES,
+    )
+
     return gspread.Client(auth=creds)
 
 # ── DATE ──────────────────────────────────────────────────────────────────────
