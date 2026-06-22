@@ -26,7 +26,7 @@ import zoneinfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-SHEET_ID    = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"
+SHEET_ID    = "1Y7MxKDgGd8fFRrnNDgz4shkoMPCFrt548QjS0ZFhB7s"
 MASTER_CSV  = "nifty50_master.csv"
 TICKER_CSV  = "ind_nifty50list.csv"
 
