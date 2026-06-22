@@ -65,9 +65,9 @@ OUTPUT_COLS = [
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
 def get_gspread_client():
-    import streamlit as st
+    creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-    info = dict(st.secrets["gcp_service_account"])
+    info = json.loads(creds_json)
 
     creds = Credentials.from_service_account_info(
         info,
