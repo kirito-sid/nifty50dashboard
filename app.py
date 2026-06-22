@@ -14,8 +14,6 @@ import plotly.express as px
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.write("Secrets:", list(st.secrets.keys()))
-
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Nifty 50 Screener | Paterson Securities",
