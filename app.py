@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 from datetime import datetime, timedelta
+from xgboost import XGBClassifier, XGBRegressor
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -23,7 +24,7 @@ st.set_page_config(
 )
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-SHEET_ID = "1Y7MxKDgGd8fFRrnNDgz4shkoMPCFrt548QjS0ZFhB7s"
+SHEET_ID = "1YsfDm4dFFM8aUfOS7uvIWDvphkSM39xOtlalgTUgkhM"
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
@@ -43,6 +44,19 @@ NIFTY50_TICKERS = [
     "BAJAJ-AUTO","TRENT","BEL","SHRIRAMFIN","HDFCLIFE",
 ]
 NIFTY50_SYMBOLS = [t + ".NS" for t in NIFTY50_TICKERS]
+
+FORWARD_N = 10  # days ahead for ML label
+
+ML_FEATURES = [
+    'EMA_10', 'EMA_20', 'EMA_50',
+    'SMA_20', 'SMA_50', 'RSI_14',
+    'MACD_line', 'MACD_signal', 'MACD_hist',
+    'Stoch_K', 'Stoch_D',
+    'ADX_14', 'ATR_14',
+    'BB_Upper', 'BB_Middle', 'BB_Lower',
+    'OBV', 'VWAP',
+    'Returns', 'Volatility',
+]
 
 ALL_INDICATORS = {
     "Close Price":          ("Close",             0,    10000, 500),
@@ -203,13 +217,16 @@ def flag_badge(val):
 # ── AUTH & DATA ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gc():
-    info = dict(st.secrets["gcp_service_account"])
-
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=SCOPES,
-    )
-
+    creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not creds_json:
+        try: creds_json = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+        except: pass
+    if creds_json:
+        info = json.loads(creds_json) if isinstance(creds_json, str) else dict(creds_json)
+    else:
+        with open("service_account.json") as f:
+            info = json.load(f)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.Client(auth=creds)
 
 @st.cache_data(ttl=300)
@@ -333,8 +350,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     strategy: 'absolute_longs' or 'bottom_fishing'
     Pool all stocks together, compute aggregate metrics.
     """
-    # Loop per stock explicitly — avoids pandas 2.x groupby.apply()
-    # swallowing the "Stock" column as the index key
     frames = []
     for stock, grp in raw_df.groupby("Stock"):
         result = compute_bt_indicators(grp.copy())
@@ -357,9 +372,7 @@ def run_backtest(raw_df, strategy="absolute_longs"):
             (bt["Supertrend_Signal"] == "SELL")
         ).astype(int)
 
-    # Avoid look-ahead bias — same as notebook
     bt["Position"] = bt.groupby("Stock")["Position"].shift(1)
-
     bt["Strategy_Return"] = bt["Position"] * bt["Daily_Return"]
 
     returns = bt["Strategy_Return"].dropna()
@@ -389,7 +402,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     gross_loss   = abs(trades[trades < 0].sum())
     profit_factor = gross_profit / gross_loss if gross_loss != 0 else np.inf
 
-    # Benchmark — equal-weight buy & hold across all stocks
     benchmark_returns = bt.groupby("Date")["Daily_Return"].mean().dropna()
     benchmark_equity  = initial_capital * (1 + benchmark_returns).cumprod()
     bench_years       = len(benchmark_returns) / 252
@@ -406,7 +418,6 @@ def run_backtest(raw_df, strategy="absolute_longs"):
         "Benchmark CAGR %": round(benchmark_cagr * 100, 2),
     }
 
-    # Build dated equity curve for chart (aggregate by date)
     eq_by_date = (
         bt.groupby("Date")["Strategy_Return"]
           .mean()
@@ -416,6 +427,236 @@ def run_backtest(raw_df, strategy="absolute_longs"):
     bench_chart    = initial_capital * (1 + benchmark_returns).cumprod()
 
     return metrics, eq_curve_chart, bench_chart, drawdown
+
+# ── ML: FETCH HISTORY ─────────────────────────────────────────────────────────
+def fetch_ml_history(progress_placeholder):
+    """Fetch 3 years OHLCV for all Nifty 50 — needed for enough training rows."""
+    end   = datetime.today()
+    start = end - timedelta(days=3 * 365)
+    frames = []
+    bar = progress_placeholder.progress(0, text="Fetching price history...")
+    for i, sym in enumerate(NIFTY50_SYMBOLS):
+        try:
+            df = yf.download(sym, start=start.strftime("%Y-%m-%d"),
+                             end=end.strftime("%Y-%m-%d"),
+                             interval="1d", auto_adjust=False, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.reset_index()[["Date","Open","High","Low","Close","Volume"]]
+            df["Stock"] = sym
+            frames.append(df)
+        except Exception:
+            pass
+        bar.progress((i + 1) / len(NIFTY50_SYMBOLS),
+                     text=f"Fetching {sym} ({i+1}/{len(NIFTY50_SYMBOLS)})...")
+    bar.empty()
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+# ── ML: COMPUTE INDICATORS ────────────────────────────────────────────────────
+def compute_ml_indicators(data):
+    data = data.sort_values("Date").copy()
+    close = data["Close"].astype(float)
+    high  = data["High"].astype(float)
+    low   = data["Low"].astype(float)
+    vol   = data["Volume"].astype(float)
+
+    for w in [20, 50]:
+        data[f"SMA_{w}"] = close.rolling(w).mean()
+    for w in [10, 20, 50]:
+        data[f"EMA_{w}"] = close.ewm(span=w, adjust=False).mean()
+
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    data["RSI_14"] = 100 - (100 / (
+        1 + gain.ewm(alpha=1/14, adjust=False).mean() /
+            (loss.ewm(alpha=1/14, adjust=False).mean() + 1e-10)
+    ))
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    data["MACD_line"]   = ema12 - ema26
+    data["MACD_signal"] = data["MACD_line"].ewm(span=9, adjust=False).mean()
+    data["MACD_hist"]   = data["MACD_line"] - data["MACD_signal"]
+
+    low14  = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    data["Stoch_K"] = 100 * (close - low14) / (high14 - low14 + 1e-10)
+    data["Stoch_D"] = data["Stoch_K"].rolling(3).mean()
+
+    hl  = high - low
+    hcp = (high - close.shift()).abs()
+    lcp = (low  - close.shift()).abs()
+    tr  = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
+    data["ATR_14"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    up   = high.diff()
+    down = low.shift() - low
+    pdm  = pd.Series(np.where((up > down) & (up > 0), up, 0), index=data.index)
+    mdm  = pd.Series(np.where((down > up) & (down > 0), down, 0), index=data.index)
+    atr_s = data["ATR_14"].replace(0, 1e-10)
+    pdi   = 100 * pdm.ewm(alpha=1/14, adjust=False).mean() / atr_s
+    mdi   = 100 * mdm.ewm(alpha=1/14, adjust=False).mean() / atr_s
+    dx    = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-10)
+    data["ADX_14"] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    data["BB_Upper"]  = bb_mid + 2 * bb_std
+    data["BB_Middle"] = bb_mid
+    data["BB_Lower"]  = bb_mid - 2 * bb_std
+
+    obv = np.zeros(len(data))
+    cv  = close.values
+    vv  = vol.values
+    for i in range(1, len(data)):
+        if cv[i] > cv[i-1]:   obv[i] = obv[i-1] + vv[i]
+        elif cv[i] < cv[i-1]: obv[i] = obv[i-1] - vv[i]
+        else:                  obv[i] = obv[i-1]
+    data["OBV"] = obv
+
+    tp = (high + low + close) / 3
+    data["VWAP"] = (tp * vol).rolling(14).sum() / (vol.rolling(14).sum() + 1e-10)
+
+    data["Returns"]    = close.pct_change() * 100
+    data["Volatility"] = data["Returns"].rolling(20).std()
+
+    # Supertrend for flag feature
+    atr7       = tr.ewm(span=7, adjust=False).mean()
+    hl2        = (high + low) / 2
+    upper_band = (hl2 + 3 * atr7).values
+    lower_band = (hl2 - 3 * atr7).values
+    n = len(data)
+    supertrend = np.zeros(n)
+    signal     = [""] * n
+    supertrend[0] = upper_band[0]
+    signal[0]     = "SELL"
+    for i in range(1, n):
+        if cv[i] > supertrend[i-1]:
+            supertrend[i] = lower_band[i]; signal[i] = "BUY"
+        else:
+            supertrend[i] = upper_band[i]; signal[i] = "SELL"
+    data["Supertrend_Signal"] = signal
+
+    return data
+
+# ── ML: DATE-BASED PIPELINE ──────────────────────────────────────────────────
+def run_date_ml_pipeline(raw_df, chosen_date, forward_n=10):
+    """
+    Given a chosen date D:
+      Train  : D - 6months → D - 2months
+      Test   : D - 2months → D
+      Predict: 10 trading days after D (future price per stock)
+
+    Returns:
+      pred_df  — all stocks with predicted price / return / direction
+      test_acc — model accuracy on test period (direction accuracy %)
+    """
+    from pandas.tseries.offsets import BDay
+
+    D        = pd.Timestamp(chosen_date)
+    train_start = D - pd.DateOffset(months=6)
+    train_end   = D - pd.DateOffset(months=2)
+    test_start  = train_end
+    test_end    = D
+
+    # Compute indicators per stock
+    frames = []
+    for stock, grp in raw_df.groupby("Stock"):
+        result = compute_ml_indicators(grp.copy())
+        result["Stock"] = stock
+        frames.append(result)
+    combined = pd.concat(frames, ignore_index=True)
+    combined["Date"] = pd.to_datetime(combined["Date"])
+    combined = combined.sort_values(["Stock", "Date"])
+
+    feat_cols = [f for f in ML_FEATURES if f in combined.columns] + ["_st_flag"]
+    combined["_st_flag"] = (combined["Supertrend_Signal"] == "BUY").astype(int)
+
+    # ── TRAIN set ─────────────────────────────────────────────────────────────
+    train_mask = (combined["Date"] >= train_start) & (combined["Date"] < train_end)
+    train_data = combined[train_mask].copy()
+
+    # Forward return label: next 10 trading days
+    train_data["_fwd_close"]      = train_data.groupby("Stock")["Close"].shift(-forward_n)
+    train_data["_fwd_return_pct"] = (train_data["_fwd_close"] - train_data["Close"]) / (train_data["Close"] + 1e-10) * 100
+    train_data["_label_dir"]      = (train_data["_fwd_return_pct"] > 0).astype(int)
+
+    train_clean = train_data.dropna(subset=feat_cols + ["_label_dir", "_fwd_return_pct"])
+    X_train = train_clean[feat_cols].fillna(0)
+    y_cls   = train_clean["_label_dir"]
+    y_reg   = train_clean["_fwd_return_pct"]
+
+    if len(X_train) < 50:
+        return None, None  # not enough data
+
+    clf = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
+                        subsample=0.8, colsample_bytree=0.8,
+                        eval_metric="logloss", random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_cls)
+
+    reg = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                       subsample=0.8, colsample_bytree=0.8,
+                       eval_metric="rmse", random_state=42, n_jobs=-1)
+    reg.fit(X_train, y_reg)
+
+    # ── TEST accuracy (May 1 → D window) ──────────────────────────────────────
+    test_mask = (combined["Date"] >= test_start) & (combined["Date"] < test_end)
+    test_data = combined[test_mask].copy()
+    test_data["_fwd_close"]      = test_data.groupby("Stock")["Close"].shift(-forward_n)
+    test_data["_fwd_return_pct"] = (test_data["_fwd_close"] - test_data["Close"]) / (test_data["Close"] + 1e-10) * 100
+    test_data["_label_dir"]      = (test_data["_fwd_return_pct"] > 0).astype(int)
+    test_clean = test_data.dropna(subset=feat_cols + ["_label_dir"])
+    test_acc = None
+    if len(test_clean) > 0:
+        X_test    = test_clean[feat_cols].fillna(0)
+        y_test    = test_clean["_label_dir"]
+        test_preds = clf.predict(X_test)
+        test_acc   = round((test_preds == y_test.values).mean() * 100, 2)
+
+    # ── PREDICT: latest row per stock on or before D ───────────────────────────
+    before_d   = combined[combined["Date"] <= test_end]
+    latest_idx = before_d.groupby("Stock")["Date"].idxmax()
+    pred_df    = combined.loc[latest_idx].copy()
+    X_pred     = pred_df[feat_cols].fillna(0)
+
+    pred_df["Bull_Probability"]     = clf.predict_proba(X_pred)[:, 1].round(4)
+    pred_df["Bear_Probability"]     = (1 - pred_df["Bull_Probability"]).round(4)
+    pred_df["Predicted_Direction"]  = np.where(pred_df["Bull_Probability"] >= 0.5, "BULL", "BEAR")
+    pred_df["Predicted_Return_Pct"] = reg.predict(X_pred).round(2)
+    pred_df["Predicted_Price"]      = (pred_df["Close"] * (1 + pred_df["Predicted_Return_Pct"] / 100)).round(2)
+
+    # Strategy flags
+    pred_df["Absolute_Longs"] = (
+        (pred_df["EMA_10"] > pred_df["EMA_20"]) &
+        (pred_df["RSI_14"] > 50) &
+        (pred_df["MACD_hist"] > 0) &
+        (pred_df["Supertrend_Signal"] == "BUY")
+    ).map({True: "YES", False: "NO"})
+
+    pred_df["Bottom_Fishing"] = (
+        (pred_df["EMA_10"] < pred_df["EMA_20"]) &
+        (pred_df["RSI_14"] < 50) &
+        (pred_df["MACD_hist"] < 0) &
+        (pred_df["Supertrend_Signal"] == "SELL")
+    ).map({True: "YES", False: "NO"})
+
+    # Target date = D + 10 trading days
+    target_date = D + BDay(forward_n)
+    pred_df["Target_Date"]      = target_date.strftime("%Y-%m-%d")
+    pred_df["As_Of_Date"]       = D.strftime("%Y-%m-%d")
+    pred_df["Stock_Universe"]   = "NIFTY50"
+
+    result = pred_df[[
+        "Stock_Universe", "Stock", "As_Of_Date", "Close",
+        "Predicted_Price", "Predicted_Direction",
+        "Bull_Probability", "Bear_Probability",
+        "Predicted_Return_Pct", "Absolute_Longs", "Bottom_Fishing",
+    ]].copy()
+    result = result.sort_values("Predicted_Return_Pct", ascending=False).reset_index(drop=True)
+    return result, test_acc
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 for key, default in [
@@ -553,8 +794,8 @@ with st.sidebar:
         use_container_width=True)
 
 # ── MAIN TABS ─────────────────────────────────────────────────────────────────
-tab_screen, tab_detail, tab_heatmap, tab_perf = st.tabs([
-    "📋 Screener", "🔍 Stock Detail", "🗺 Sector Heatmap", "📈 Performance"
+tab_screen, tab_detail, tab_perf, tab_ml = st.tabs([
+    "📋 Screener", "🔍 Stock Detail", "📈 Performance", "🤖 ML Predictions"
 ])
 
 with st.spinner("Loading data..."):
@@ -651,7 +892,6 @@ with tab_detail:
             st.markdown(f"### {selected} &nbsp; <span style='font-size:14px;color:#888'>{row.get('Sector','')}</span>",
                         unsafe_allow_html=True)
 
-            # Fetch 1Y history live for the chart
             with st.spinner("Loading chart data..."):
                 try:
                     end_dt   = datetime.today()
@@ -697,7 +937,6 @@ with tab_detail:
                     legend=dict(orientation="h", y=1.08), font=dict(size=11))
                 st.plotly_chart(fig, use_container_width=True)
 
-                # RSI sub-chart
                 delta    = hist["Close"].diff()
                 ag       = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
                 al_      = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
@@ -715,7 +954,6 @@ with tab_detail:
             else:
                 st.info("Chart data unavailable for this stock.")
 
-            # Indicator snapshot
             st.markdown("#### Indicator Snapshot")
             ind_groups = {
                 "📈 Trend":     [("EMA 10","EMA_10"),("EMA 20","EMA_20"),("SMA 50","SMA_50"),
@@ -773,60 +1011,7 @@ with tab_detail:
                   <div style="font-size:11px;color:#888;margin-top:4px">Reversal signal</div>
                 </div>""", unsafe_allow_html=True)
 
-# ── TAB 3: SECTOR HEATMAP ─────────────────────────────────────────────────────
-with tab_heatmap:
-    st.markdown("## Sector Heatmap")
-    st.caption("Average return and signal counts by sector")
-
-    if "Sector" in df.columns and "Returns" in df.columns:
-        heatmap_df   = filtered if st.session_state.filters else df
-        sector_stats = heatmap_df.groupby("Sector").agg(
-            Stocks      =("Stock","count"),
-            Avg_Return  =("Returns","mean"),
-            BUY_Count   =("Supertrend_Signal", lambda x: (x.astype(str).str.upper()=="BUY").sum()),
-            AL_Count    =("Absolute_Longs",    lambda x: (x.astype(str).str.upper()=="YES").sum()),
-            BF_Count    =("Bottom_Fishing",    lambda x: (x.astype(str).str.upper()=="YES").sum()),
-        ).reset_index().sort_values("Avg_Return", ascending=False)
-
-        fig_heat = px.bar(sector_stats, x="Sector", y="Avg_Return",
-            color="Avg_Return",
-            color_continuous_scale=["#c24141","#f5e6e6","#e6f4ee","#008a58"],
-            color_continuous_midpoint=0,
-            text=sector_stats["Avg_Return"].apply(lambda x: f"{x:+.2f}%"),
-            title="Average Return % by Sector",
-            labels={"Avg_Return":"Avg Return (%)"},
-        )
-        fig_heat.update_traces(textposition="outside")
-        fig_heat.update_layout(height=380, template="plotly_white",
-            margin=dict(l=0,r=0,t=40,b=0), coloraxis_showscale=False,
-            font=dict(size=11), xaxis_tickangle=-30)
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-        h1, h2 = st.columns(2)
-        with h1:
-            fig_al = px.bar(sector_stats.sort_values("AL_Count", ascending=False),
-                x="Sector", y="AL_Count", title="🚀 Absolute Longs by Sector",
-                color_discrete_sequence=["#2e75b6"], labels={"AL_Count":"Count"})
-            fig_al.update_layout(height=300, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0), font=dict(size=11), xaxis_tickangle=-30)
-            st.plotly_chart(fig_al, use_container_width=True)
-        with h2:
-            fig_bf = px.bar(sector_stats.sort_values("BF_Count", ascending=False),
-                x="Sector", y="BF_Count", title="🎣 Bottom-Fishing by Sector",
-                color_discrete_sequence=["#c24141"], labels={"BF_Count":"Count"})
-            fig_bf.update_layout(height=300, template="plotly_white",
-                margin=dict(l=0,r=0,t=40,b=0), font=dict(size=11), xaxis_tickangle=-30)
-            st.plotly_chart(fig_bf, use_container_width=True)
-
-        st.dataframe(
-            sector_stats.rename(columns={"Avg_Return":"Avg Return %","BUY_Count":"Supertrend BUY",
-                "AL_Count":"Absolute Longs","BF_Count":"Bottom-Fishing"})
-            .style.format({"Avg Return %":"{:+.2f}"}),
-            use_container_width=True, hide_index=True)
-    else:
-        st.info("Sector data not available. Run screener first.")
-
-# ── TAB 4: PERFORMANCE ────────────────────────────────────────────────────────
+# ── TAB 3: PERFORMANCE ────────────────────────────────────────────────────────
 with tab_perf:
     st.markdown("## Strategy Performance")
     st.caption("Last 1 year · All Nifty 50 stocks pooled · Position shifted 1 day to avoid look-ahead bias")
@@ -874,7 +1059,6 @@ with tab_perf:
                 </div>""", unsafe_allow_html=True)
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-        # Equity curve
         eq_df = pd.DataFrame({
             "Date":      eq_curve.index,
             "Strategy":  eq_curve.values,
@@ -895,7 +1079,6 @@ with tab_perf:
             yaxis_tickprefix="₹", font=dict(size=11))
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        # Drawdown
         dd_df = drawdown_series.reset_index()
         dd_df.columns = ["Index","Drawdown"]
         fig_dd = go.Figure()
@@ -923,7 +1106,6 @@ with tab_perf:
 
             st.divider()
 
-            # ── Side-by-side strategy tabs ────────────────────────────────────
             strat_tab_al, strat_tab_bf, strat_tab_cmp = st.tabs([
                 "🚀 Absolute Longs", "🎣 Bottom-Fishing", "⚖ Comparison"
             ])
@@ -959,7 +1141,6 @@ with tab_perf:
                 })
                 st.dataframe(cmp_df, use_container_width=True, hide_index=True)
 
-                # Overlay equity curves
                 al_df = pd.DataFrame({"Date": al_eq.index, "Absolute Longs": al_eq.values})
                 bf_df = pd.DataFrame({"Date": bf_eq.index, "Bottom-Fishing": bf_eq.values})
                 bk_df = pd.DataFrame({"Date": al_bench.index, "Benchmark": al_bench.values})
@@ -980,3 +1161,165 @@ with tab_perf:
                 st.plotly_chart(fig_cmp, use_container_width=True)
     else:
         st.info("Click **▶ Run Backtest** to fetch 1 year of data and compute performance metrics for both strategies.")
+
+# ── TAB 4: ML PREDICTIONS ─────────────────────────────────────────────────────
+with tab_ml:
+    st.markdown("## 📅 Date-Based Prediction Panel")
+
+    # ── DATE-BASED PREDICTION PANEL ───────────────────────────────────────────    
+    st.caption(
+        "Pick a date D → Train on [D−6m, D−2m] → Validate on [D−2m, D] → "
+        "Predict price 10 trading days after D"
+    )
+
+    dp_col1, dp_col2 = st.columns([2, 5])
+    with dp_col1:
+        max_allowed = datetime.today().date() - timedelta(days=1)
+        min_allowed = datetime.today().date() - timedelta(days=3 * 365)
+        chosen_date = st.date_input(
+            "Select Date (D)",
+            value=max_allowed,
+            min_value=min_allowed,
+            max_value=max_allowed,
+            key="ml_date_picker",
+        )
+        run_date_ml = st.button("▶ Run Date Prediction", type="primary", key="run_date_ml_btn")
+
+    with dp_col2:
+        D_ts        = pd.Timestamp(chosen_date)
+        train_s     = (D_ts - pd.DateOffset(months=6)).strftime("%b %d, %Y")
+        train_e     = (D_ts - pd.DateOffset(months=2)).strftime("%b %d, %Y")
+        test_e      = D_ts.strftime("%b %d, %Y")
+        from pandas.tseries.offsets import BDay
+        target_d    = (D_ts + BDay(10)).strftime("%b %d, %Y")
+        st.markdown(f"""
+        <div style="background:#f8f9fa;border:1px solid #e0e0e0;border-radius:10px;
+             padding:14px 18px;font-size:13px;line-height:2">
+          <span style="color:#888">🟦 Train period:</span>
+          <strong>{train_s} → {train_e}</strong><br>
+          <span style="color:#888">🟨 Test period &nbsp;:</span>
+          <strong>{train_e} → {test_e}</strong><br>
+          <span style="color:#888">🎯 Predict for &nbsp;:</span>
+          <strong style="color:#2e75b6">{target_d} (+10 trading days)</strong>
+        </div>""", unsafe_allow_html=True)
+
+    if "date_ml_results" not in st.session_state:
+        st.session_state.date_ml_results  = None
+        st.session_state.date_ml_acc      = None
+        st.session_state.date_ml_date     = None
+
+    if run_date_ml:
+        prog2 = st.empty()
+        with st.spinner("Fetching 3 years of data for 50 stocks..."):
+            raw_df2 = fetch_ml_history(prog2)
+
+        if raw_df2.empty:
+            st.error("Could not fetch price data.")
+        else:
+            with st.spinner("Training on selected window + generating predictions..."):
+                date_pred, test_acc = run_date_ml_pipeline(raw_df2, chosen_date, forward_n=FORWARD_N)
+
+            if date_pred is None:
+                st.error("Not enough data in the selected date range. Try an earlier date.")
+            else:
+                st.session_state.date_ml_results = date_pred
+                st.session_state.date_ml_acc     = test_acc
+                st.session_state.date_ml_date    = chosen_date
+                st.success(
+                    f"Done! Model test accuracy: **{test_acc}%** on "
+                    f"[{train_e} → {test_e}] window."
+                )
+
+    if st.session_state.date_ml_results is not None:
+        date_pred = st.session_state.date_ml_results
+        test_acc  = st.session_state.date_ml_acc
+        sel_date  = st.session_state.date_ml_date
+
+        # Summary metrics
+        bull_n2 = (date_pred["Predicted_Direction"] == "BULL").sum()
+        bear_n2 = (date_pred["Predicted_Direction"] == "BEAR").sum()
+        avg_ret2 = date_pred["Predicted_Return_Pct"].mean()
+
+        dm1, dm2, dm3, dm4 = st.columns(4, gap="small")
+        dm1.metric("BULL",              int(bull_n2))
+        dm2.metric("BEAR",              int(bear_n2))
+        dm3.metric("Avg Predicted Ret", f"{avg_ret2:+.2f}%")
+        dm4.metric("Test Accuracy",     f"{test_acc}%" if test_acc else "—")
+        st.divider()
+
+        # Filter
+        df1, df2 = st.columns([2, 2])
+        with df1:
+            dir_f2 = st.selectbox("Direction", ["All","BULL","BEAR"], key="date_ml_dir")
+        with df2:
+            sort_f2 = st.selectbox(
+                "Sort by",
+                ["Predicted_Return_Pct", "Bull_Probability", "Bear_Probability", "Predicted_Price"],
+                key="date_ml_sort",
+            )
+
+        disp2 = date_pred.copy()
+        if dir_f2 != "All":
+            disp2 = disp2[disp2["Predicted_Direction"] == dir_f2]
+        disp2 = disp2.sort_values(sort_f2, ascending=(sort_f2 == "Predicted_Price"))
+
+        # Table
+        rows2 = []
+        for _, row in disp2.iterrows():
+            stock      = str(row["Stock"]).replace(".NS", "")
+            universe   = str(row["Stock_Universe"])
+            as_of      = str(row["As_Of_Date"])
+            dir_val    = str(row["Predicted_Direction"])
+            bull_prob  = float(row["Bull_Probability"])
+            bear_prob  = float(row["Bear_Probability"])
+            ret        = float(row["Predicted_Return_Pct"])
+            close_p    = row["Close"]
+            pred_p     = row["Predicted_Price"]
+            abs_longs  = str(row["Absolute_Longs"])
+            bot_fish   = str(row["Bottom_Fishing"])
+
+            dir_badge       = (f'<span class="badge-buy">{dir_val}</span>' if dir_val == "BULL"
+                               else f'<span class="badge-sell">{dir_val}</span>')
+            bull_prob_color = "#008a58" if bull_prob >= 0.6 else ("#e07c00" if bull_prob >= 0.5 else "#c24141")
+            bear_prob_color = "#c24141" if bear_prob >= 0.6 else ("#e07c00" if bear_prob >= 0.5 else "#008a58")
+            ret_cls         = "up" if ret > 0 else "dn"
+            price_cls       = "up" if pred_p > close_p else "dn"
+
+            rows2.append(f"""<tr>
+              <td>{universe}</td>
+              <td><strong>{stock}</strong></td>
+              <td>{as_of}</td>
+              <td>{fmt(close_p)}</td>
+              <td><span class="{price_cls}">{fmt(pred_p)}</span></td>
+              <td>{dir_badge}</td>
+              <td><span style="color:{bull_prob_color};font-weight:700">{bull_prob:.2%}</span></td>
+              <td><span style="color:{bear_prob_color};font-weight:700">{bear_prob:.2%}</span></td>
+              <td><span class="{ret_cls}">{ret:+.2f}%</span></td>
+              <td>{flag_badge(abs_longs)}</td>
+              <td>{flag_badge(bot_fish)}</td>
+            </tr>""")
+
+        st.markdown(f"""
+        <div class="tbl-wrap">
+          <table class="screener-table">
+            <thead><tr>
+              <th>Stock Universe</th>
+              <th>Stock</th>
+              <th>Date</th>
+              <th>Close</th>
+              <th>Predicted Price</th>
+              <th>Predicted Direction</th>
+              <th>Bull Probability</th>
+              <th>Bear Probability</th>
+              <th>Predicted Return %</th>
+              <th>Absolute Longs</th>
+              <th>Bottom Fishing</th>
+            </tr></thead>
+            <tbody>{"".join(rows2)}</tbody>
+          </table>
+        </div>""", unsafe_allow_html=True)
+        st.caption(f"{len(disp2)} stocks · predictions for {date_pred['As_Of_Date'].iloc[0]}")
+        st.download_button("⬇ Download CSV", disp2.to_csv(index=False),
+            file_name=f"ml_date_predictions_{sel_date}.csv", mime="text/csv")
+    else:
+        st.info("Click **▶ Run Date Prediction** to fetch data, train models, and generate predictions.")
