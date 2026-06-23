@@ -107,38 +107,38 @@ html, body, .stApp,
 [data-testid="stAppViewContainer"],
 [data-testid="stHeader"],
 [data-testid="stSidebar"] {
-    background-color: #0f1117 !important;
-    color: #e8eaf0 !important;
+    background-color: #f8f9fa !important;
+    color: #1a1a1a !important;
 }
 [data-testid="stTabs"] button {
-    color: #888888 !important; font-weight: 600 !important;
+    color: #444444 !important; font-weight: 600 !important;
     font-size: 14px !important; background: transparent !important;
     border: none !important; padding: 10px 20px !important;
 }
 [data-testid="stTabs"] button[aria-selected="true"] {
-    color: #e8eaf0 !important; border-bottom: 3px solid #4f8ef7 !important;
+    color: #1a1a1a !important; border-bottom: 3px solid #2e75b6 !important;
 }
-[data-testid="stTabs"] button:hover { color: #4f8ef7 !important; }
+[data-testid="stTabs"] button:hover { color: #2e75b6 !important; }
 section[data-testid="stSidebar"] {
-    background-color: #161b22 !important; border-right: 1px solid #30363d !important;
+    background-color: #ffffff !important; border-right: 1px solid #e0e0e0 !important;
 }
 [data-testid="metric-container"] {
-    background: #161b22 !important; border: 1px solid #30363d !important;
+    background: #ffffff !important; border: 1px solid #e0e0e0 !important;
     border-radius: 10px !important; padding: 14px !important;
 }
-[data-testid="stMetricLabel"]  { color: #8b949e !important; font-size: 11px !important; text-transform: uppercase; }
-[data-testid="stMetricValue"]  { color: #e8eaf0 !important; font-size: 28px !important; font-weight: 700 !important; }
+[data-testid="stMetricLabel"]  { color: #666666 !important; font-size: 11px !important; text-transform: uppercase; }
+[data-testid="stMetricValue"]  { color: #1a1a1a !important; font-size: 28px !important; font-weight: 700 !important; }
 .stButton button {
     border-radius: 8px !important; font-weight: 600 !important;
-    font-size: 13px !important; border: 1px solid #30363d !important;
-    background: #161b22 !important; color: #e8eaf0 !important;
+    font-size: 13px !important; border: 1px solid #d0d0d0 !important;
+    background: #ffffff !important; color: #1a1a1a !important;
 }
 .stButton button[kind="primary"] {
-    background: #4f8ef7 !important; color: #ffffff !important; border: none !important;
+    background: #2e75b6 !important; color: #ffffff !important; border: none !important;
 }
 .tbl-wrap {
     overflow-x: auto; overflow-y: auto; max-height: 65vh;
-    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    background: #ffffff; border: 1px solid #e0e0e0; border-radius: 10px;
 }
 .screener-table {
     width: 100%; border-collapse: collapse;
@@ -147,32 +147,31 @@ section[data-testid="stSidebar"] {
 }
 .screener-table th {
     position: sticky; top: 0; z-index: 5;
-    background: #1c2128; color: #8b949e;
+    background: #f4f6f8; color: #666666;
     text-transform: uppercase; letter-spacing: .05em;
     font-size: 11px; font-weight: 700;
     padding: 11px 14px; text-align: left;
-    border-bottom: 2px solid #30363d; white-space: nowrap;
+    border-bottom: 2px solid #e0e0e0; white-space: nowrap;
 }
-.screener-table td { padding: 11px 14px; border-bottom: 1px solid #21262d; color: #e8eaf0; white-space: nowrap; }
-.screener-table tr:hover td { background: #1c2128; }
-.badge-buy  { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#0d2a1a; color:#3fb950; font-size:11px; font-weight:700; }
-.badge-sell { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#2d0e0e; color:#f85149; font-size:11px; font-weight:700; }
-.badge-yes  { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#0d1f3c; color:#4f8ef7; font-size:11px; font-weight:700; }
-.badge-no   { color:#484f58; font-size:12px; }
-.up  { color:#3fb950; font-weight:600; }
-.dn  { color:#f85149; font-weight:600; }
-.neu { color:#8b949e; }
+.screener-table td { padding: 11px 14px; border-bottom: 1px solid #f0f0f0; color: #1a1a1a; white-space: nowrap; }
+.screener-table tr:hover td { background: #f8f9fa; }
+.badge-buy  { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#e6f4ee; color:#008a58; font-size:11px; font-weight:700; }
+.badge-sell { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#fdecea; color:#c24141; font-size:11px; font-weight:700; }
+.badge-yes  { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; background:#e8f0fb; color:#2e75b6; font-size:11px; font-weight:700; }
+.badge-no   { color:#cccccc; font-size:12px; }
+.up  { color:#008a58; font-weight:600; }
+.dn  { color:#c24141; font-weight:600; }
+.neu { color:#888888; }
 .metric-card {
-    background:#161b22; border:1px solid #30363d; border-radius:12px;
+    background:#ffffff; border:1px solid #e0e0e0; border-radius:12px;
     padding:20px 24px; text-align:center;
 }
-.metric-card .mc-label { font-size:11px; color:#8b949e; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
-.metric-card .mc-value { font-size:2rem; font-weight:700; color:#e8eaf0; }
-.metric-card .mc-value.positive { color:#3fb950; }
-.metric-card .mc-value.negative { color:#f85149; }
+.metric-card .mc-label { font-size:11px; color:#888888; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+.metric-card .mc-value { font-size:2rem; font-weight:700; color:#1a1a1a; }
+.metric-card .mc-value.positive { color:#008a58; }
+.metric-card .mc-value.negative { color:#c24141; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-thumb { background: #30363d; border-radius: 10px; }
-::-webkit-scrollbar-track { background: #0f1117; }
+::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
