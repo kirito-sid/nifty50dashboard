@@ -233,6 +233,7 @@ def filter_display_label(f):
 
 # ── AUTH & DATA ───────────────────────────────────────────────────────────────
 @st.cache_resource
+def get_gc():
     info = dict(st.secrets["gcp_service_account"])
 
     creds = Credentials.from_service_account_info(
